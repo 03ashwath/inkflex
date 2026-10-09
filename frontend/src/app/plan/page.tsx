@@ -3,7 +3,16 @@
 import { useState } from 'react';
 import Link from 'next/link';
 import ResultsDashboard, { type ResultsDashboardData } from '@/components/ResultsDashboard';
+import TattooSizePicker from '@/components/TattooSizePicker';
 import { INDIAN_CITIES, INDIAN_CITY_ALIASES, resolveIndianCity } from '@/lib/indian-cities';
+import {
+  PROPORTIONS,
+  formatInches,
+  recommendedDimensions,
+  validateDimensions,
+  type Complexity,
+  type TattooDimensions,
+} from '@/lib/tattoo-dimensions';
 
 export default function PlanPage() {
   const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8001';
@@ -15,8 +24,6 @@ export default function PlanPage() {
     designText: '',
     inkColor: '',
     inkBrand: 'No Preference',
-    sizeCategory: 'Medium',
-    customSize: '',
     bodyPart: '',
     country: 'India',
     city: '',
@@ -27,13 +34,15 @@ export default function PlanPage() {
   const [isLoading, setIsLoading] = useState(false);
   const [locationStatus, setLocationStatus] = useState('');
   const [resultsData, setResultsData] = useState<ResultsDashboardData | null>(null);
+  const [dimensions, setDimensions] = useState<TattooDimensions>(() => recommendedDimensions(PROPORTIONS[0], 'Medium'));
   const cityOptions = [...INDIAN_CITIES, ...Object.keys(INDIAN_CITY_ALIASES)];
+  // Long written briefs usually mean detailed artwork.
+  const complexity: Complexity = formData.designType === 'text' && formData.designText.length > 50 ? 'Complex' : 'Medium';
+  const sizeLabel = `${formatInches(dimensions.width)} x ${formatInches(dimensions.height)} in`;
 
   const fetchResults = async () => {
     setIsLoading(true);
     try {
-      const sizeMapping: Record<string, number> = { 'Small': 5, 'Medium': 15, 'Large': 40, 'Custom': 20 };
-      
       const modelCountry = 'IN';
       const enteredCity = formData.city.trim();
       const modelCity = resolveIndianCity(enteredCity) ?? enteredCity;
@@ -42,21 +51,21 @@ export default function PlanPage() {
         setIsLoading(false);
         return;
       }
+      const sizeErrors = validateDimensions(dimensions.width, dimensions.height, complexity, formData.bodyPart);
+      if (sizeErrors.length > 0) {
+        window.alert(sizeErrors.join(' '));
+        setIsLoading(false);
+        return;
+      }
 
-      const isColor = formData.inkColor === 'Colour' ? 1 : 0;
-      const complexity = formData.designType === 'text' && formData.designText.length > 50 ? 8 : 5;
-      
       const payload = {
         country: modelCountry,
         city: modelCity,
-        size_sq_inches: formData.sizeCategory === 'Custom' ? (parseFloat(formData.customSize) || 20.0) : (sizeMapping[formData.sizeCategory] || 15.0),
-        body_part: formData.bodyPart || 'Arm',
-        tattoo_style: 'Realism',
-        complexity: complexity,
-        is_color: isColor,
-        color_count: isColor ? 5 : 1,
-        shading_level: 5,
-        ink_brand: formData.inkBrand
+        width_in: dimensions.width,
+        height_in: dimensions.height,
+        complexity,
+        color: formData.inkColor === 'Colour' ? 'Colored' : 'Black_Gray',
+        placement: formData.bodyPart || undefined,
       };
 
       const res = await fetch(`${API_BASE_URL}/api/price/predict`, {
@@ -80,14 +89,14 @@ export default function PlanPage() {
           explanation: "Based on the provided information, a preliminary risk assessment was made. This is an AI assessment and does not constitute medical advice.",
           sources: []
         },
-        designText: formData.designType === 'text' && formData.designText.trim() ? formData.designText : `${formData.inkColor !== 'No Preference' ? formData.inkColor + ' ' : ''}${formData.sizeCategory} tattoo design`,
+        designText: formData.designType === 'text' && formData.designText.trim() ? formData.designText : `${formData.inkColor !== 'No Preference' ? formData.inkColor + ' ' : ''}${sizeLabel} tattoo design`,
         city: formData.city,
         country: formData.country,
         countryCode: 'IN',
         skinTone: formData.skinTone,
         inkColor: formData.inkColor,
         inkBrand: formData.inkBrand,
-        sizeCategory: formData.sizeCategory
+        sizeLabel
       });
       setShowResults(true);
     } catch (error) {
@@ -95,13 +104,13 @@ export default function PlanPage() {
       // Fallback if backend fails
       setResultsData({
         price_prediction: {
-          predicted_price_mid: 350.50,
-          predicted_price_min: 290.00,
-          predicted_price_max: 410.00,
-          factors: ["Size: 15 sq inches", "Complexity Level: 8/10", `Location: ${formData.city}, India`]
+          predicted_price_mid: 13500,
+          predicted_price_min: 9000,
+          predicted_price_max: 18000,
+          factors: ["Price service unavailable; showing a typical range", `Size: ${sizeLabel}`, `Location: ${formData.city}, India`]
         },
         health_assessment: { category: "Lower concern", factors: [], explanation: "Fallback", sources: [] },
-        designText: formData.designType === 'text' && formData.designText.trim() ? formData.designText : `${formData.inkColor !== 'No Preference' ? formData.inkColor + ' ' : ''}${formData.sizeCategory} tattoo design`, city: formData.city, country: 'India', countryCode: 'IN', skinTone: formData.skinTone, inkColor: formData.inkColor, sizeCategory: formData.sizeCategory
+        designText: formData.designType === 'text' && formData.designText.trim() ? formData.designText : `${formData.inkColor !== 'No Preference' ? formData.inkColor + ' ' : ''}${sizeLabel} tattoo design`, city: formData.city, country: 'India', countryCode: 'IN', skinTone: formData.skinTone, inkColor: formData.inkColor, sizeLabel
       });
       setShowResults(true);
     }
@@ -283,7 +292,7 @@ export default function PlanPage() {
 
                <div className="mt-10">
                  <h3 className="text-xl font-bold text-slate-200 mb-4">Type of Ink</h3>
-                 <p className="text-slate-400 mb-4 text-sm">Choose a specific brand or select &apos;No Preference&apos;. Different types of ink have different pricing.</p>
+                 <p className="text-slate-400 mb-4 text-sm">Choose a specific brand or select &apos;No Preference&apos;.</p>
                  <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
                    {['Eternal Ink', 'Dynamic Color', 'Intenze Tattoo Ink', 'Kuro Sumi', 'Xtreme Ink', 'No Preference'].map(brand => (
                      <button
@@ -303,29 +312,13 @@ export default function PlanPage() {
             <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
                <div className="mb-10">
                  <h3 className="text-xl font-bold text-slate-200 mb-4">Tattoo Size</h3>
-                 <div className="flex space-x-4">
-                   {['Small', 'Medium', 'Large', 'Custom'].map(size => (
-                     <button 
-                       key={size}
-                       onClick={() => setFormData(d => ({ ...d, sizeCategory: size }))}
-                       className={`flex-1 py-3 rounded-xl font-medium transition-colors border ${formData.sizeCategory === size ? 'bg-purple-600 text-white border-purple-500' : 'bg-slate-800 text-slate-300 border-slate-700 hover:bg-slate-700'}`}
-                     >
-                       {size}
-                     </button>
-                   ))}
-                 </div>
-                 {formData.sizeCategory === 'Custom' && (
-                   <div className="mt-4">
-                     <label className="block text-slate-300 mb-2 font-medium">Custom Size (sq inches)</label>
-                     <input 
-                       type="number"
-                       placeholder="e.g. 25"
-                       className="w-full bg-slate-950 border border-slate-700 rounded-xl p-4 text-slate-200 focus:ring-2 focus:ring-purple-500 focus:outline-none"
-                       value={formData.customSize}
-                       onChange={(e) => setFormData(d => ({ ...d, customSize: e.target.value }))}
-                     />
-                   </div>
-                 )}
+                 <TattooSizePicker
+                   value={dimensions}
+                   complexity={complexity}
+                   placement={formData.bodyPart}
+                   onChange={setDimensions}
+                   variant="dark"
+                 />
                </div>
 
                <div>

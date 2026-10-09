@@ -2,48 +2,63 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import BodyAreaPicker from '../components/BodyAreaPicker';
-import { formatInr, useUsdToInrRate } from '../lib/currency';
+import TattooSizePicker from '../components/TattooSizePicker';
+import { formatInr } from '../lib/currency';
 import { INDIAN_CITIES, INDIAN_CITY_ALIASES, resolveIndianCity } from '../lib/indian-cities';
+import {
+  PROPORTIONS,
+  nearestProportion,
+  recommendedDimensions,
+  refitDimensions,
+  validateDimensions,
+  type Complexity,
+  type TattooDimensions,
+} from '../lib/tattoo-dimensions';
 
 const navItems: string[] = [];
-const complexityOptions = ['Simple', 'Medium', 'Complex'];
-const sizeAreaEstimates: Record<string, number> = {
-  tiny: 2.5,
-  small: 6.5,
-  medium: 12.5,
-  large: 20.4,
-  'small-custom': 6.5,
-  'medium-custom': 12.5,
-  'large-standalone': 37.3,
-  'half-sleeve': 89.4,
-  'full-sleeve': 204.4,
-  'full-back': 400.2,
-};
+const complexityOptions: Complexity[] = ['Simple', 'Medium', 'Complex'];
+type TattooColor = 'Black_Gray' | 'Colored';
+
 type LocationOption = {
   label: string;
   value: string;
+  kind: string;
+  state?: string;
+  locationType?: string;
+};
+
+type ApiLocation = {
+  name: string;
+  state: string;
+  location_type: string;
+  parent_city: string | null;
 };
 
 type PriceExample = {
   label: string;
   location: string;
-  size: string;
+  dimensions: TattooDimensions;
   placement: string;
-  complexity: string;
-  designType: string;
-  color: string;
+  complexity: Complexity;
+  color: TattooColor;
 };
 
 type DatasetPricePrediction = {
   predicted_price_min: number;
   predicted_price_max: number;
   predicted_price_mid: number;
+  extrapolated: boolean;
+  location_matched: boolean;
   factors: string[];
 };
 
 type ReferenceImageMetadata = {
-  complexity: 'Simple' | 'Medium' | 'Complex';
-  color: 'Black_Gray' | 'Colored';
+  complexity: Complexity;
+  color: TattooColor;
+  min_width_in: number;
+  min_height_in: number;
+  pixel_width: number;
+  pixel_height: number;
 };
 
 function isReferenceImageMetadata(value: unknown): value is ReferenceImageMetadata {
@@ -51,7 +66,30 @@ function isReferenceImageMetadata(value: unknown): value is ReferenceImageMetada
     'complexity' in value &&
     ['Simple', 'Medium', 'Complex'].includes(String(value.complexity)) &&
     'color' in value &&
-    ['Black_Gray', 'Colored'].includes(String(value.color));
+    ['Black_Gray', 'Colored'].includes(String(value.color)) &&
+    'pixel_width' in value && typeof value.pixel_width === 'number' &&
+    'pixel_height' in value && typeof value.pixel_height === 'number';
+}
+
+const LOCATION_KIND_LABELS: Record<string, string> = {
+  'Popular Locality': 'Locality',
+  'City/Town': 'City',
+  District: 'District',
+  'State/UT': 'State',
+};
+
+function toLocationOption(location: ApiLocation): LocationOption {
+  const suffix = location.location_type === 'Popular Locality' && location.parent_city
+    ? `${location.parent_city}, ${location.state}`
+    : location.state;
+  const name = location.location_type === 'District' ? `${location.name} district` : location.name;
+  return {
+    label: location.location_type === 'State/UT' ? `${location.name} (state average)` : `${name}, ${suffix}`,
+    value: location.name,
+    kind: LOCATION_KIND_LABELS[location.location_type] ?? 'Place',
+    state: location.state,
+    locationType: location.location_type,
+  };
 }
 
 function getReferenceImageFilename(imageUrl: string): string {
@@ -62,36 +100,34 @@ const priceExamples: PriceExample[] = [
   {
     label: 'Tiny wrist tattoo',
     location: 'Mumbai',
-    size: 'tiny',
+    dimensions: { width: 2, height: 2, proportion: '1:1' },
     placement: 'Wrist',
     complexity: 'Simple',
-    designType: 'Flash design',
-    color: 'black-and-grey',
+    color: 'Black_Gray',
   },
   {
     label: 'Medium forearm tattoo',
     location: 'Bengaluru',
-    size: 'medium',
+    dimensions: { width: 3, height: 4, proportion: '3:4' },
     placement: 'Forearm',
     complexity: 'Medium',
-    designType: 'Semi-custom',
-    color: 'black-and-grey',
+    color: 'Black_Gray',
   },
   {
     label: 'Half sleeve custom tattoo',
     location: 'Pune',
-    size: 'half-sleeve',
+    dimensions: { width: 10, height: 12, proportion: 'custom' },
     placement: 'Half Sleeve',
     complexity: 'Complex',
-    designType: 'Fully custom',
-    color: 'full-color',
+    color: 'Colored',
   },
 ];
 
-const locationOptions: LocationOption[] = [
+// Used when the API location list cannot be loaded.
+const fallbackLocationOptions: LocationOption[] = [
   ...INDIAN_CITIES,
   ...Object.keys(INDIAN_CITY_ALIASES),
-].map((city) => ({ label: `${city}, India`, value: city }));
+].map((city) => ({ label: `${city}, India`, value: city, kind: 'City' }));
 
 type PlacementSection = {
   label: string;
@@ -275,10 +311,11 @@ export default function Home() {
   const [placementSearch, setPlacementSearch] = useState('');
   const [selectedPlacement, setSelectedPlacement] = useState('');
   const [showPlacementOptions, setShowPlacementOptions] = useState(false);
-  const [selectedComplexity, setSelectedComplexity] = useState('Medium');
-  const [selectedDesignType, setSelectedDesignType] = useState('Semi-custom');
-  const [selectedSize, setSelectedSize] = useState('');
-  const [selectedColor, setSelectedColor] = useState('');
+  const [selectedComplexity, setSelectedComplexity] = useState<Complexity>('Medium');
+  const [dimensions, setDimensions] = useState<TattooDimensions>(() => recommendedDimensions(PROPORTIONS[0], 'Medium'));
+  const [selectedColor, setSelectedColor] = useState<TattooColor | ''>('');
+  const [locationOptions, setLocationOptions] = useState<LocationOption[]>(fallbackLocationOptions);
+  const [selectedLocationOption, setSelectedLocationOption] = useState<LocationOption | null>(null);
   const [datasetPricePrediction, setDatasetPricePrediction] = useState<DatasetPricePrediction | null>(null);
   const [pricePredictionError, setPricePredictionError] = useState('');
   const [isPredictingPrice, setIsPredictingPrice] = useState(false);
@@ -289,17 +326,33 @@ export default function Home() {
   const [selectedGeneratedImage, setSelectedGeneratedImage] = useState<string | null>(null);
   const [isLoadingGeneratedImages, setIsLoadingGeneratedImages] = useState(false);
   const [imageGenerationError, setImageGenerationError] = useState('');
-  const { rate: usdToInrRate, isLoaded: isExchangeRateLoaded, hasError: exchangeRateFailed } = useUsdToInrRate();
-  const formatEstimatePrice = (amount: number) => formatInr(amount, usdToInrRate);
-
   useEffect(() => {
     return () => {
       if (uploadedImage) URL.revokeObjectURL(uploadedImage.previewUrl);
     };
   }, [uploadedImage]);
 
+  useEffect(() => {
+    let isMounted = true;
+    fetch(`${API_BASE_URL}/api/locations`)
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`Location list request failed with status ${response.status}.`);
+        const locations = await response.json() as ApiLocation[];
+        if (isMounted && Array.isArray(locations) && locations.length > 0) {
+          setLocationOptions(locations.map(toLocationOption));
+        }
+      })
+      .catch((error: unknown) => {
+        console.error('Unable to load dataset locations; using the built-in city list.', error);
+      });
+    return () => {
+      isMounted = false;
+    };
+  }, [API_BASE_URL]);
+
+  const sizeErrors = validateDimensions(dimensions.width, dimensions.height, selectedComplexity, selectedPlacement);
   const estimateInputsComplete = Boolean(
-    selectedLocation && selectedSize && selectedPlacement && selectedColor
+    selectedLocation && selectedPlacement && selectedColor && sizeErrors.length === 0
   );
   const outputDesignImage = uploadedImage?.previewUrl ?? selectedGeneratedImage;
   const clearPricePrediction = () => {
@@ -318,7 +371,7 @@ export default function Home() {
       const text = `${item.label} ${item.value}`.toLowerCase();
       return text.includes(normalized);
     }).slice(0, 14);
-  }, [query]);
+  }, [query, locationOptions]);
 
   const availablePlacementSections = selectedBodyArea
     ? placementSectionsByArea[selectedBodyArea] ?? placementSections
@@ -330,23 +383,37 @@ export default function Home() {
     }))
     .filter((section) => section.options.length > 0);
 
-  const handleSelectLocation = (value: string) => {
-    const city = resolveIndianCity(value) ?? value;
+  const handleSelectLocation = (value: string, option?: LocationOption) => {
+    const city = option ? option.value : resolveIndianCity(value) ?? value;
     clearPricePrediction();
     setSelectedLocation(city);
-    setQuery(city);
+    setSelectedLocationOption(option ?? null);
+    setQuery(option?.label ?? city);
     setShowSuggestions(false);
+  };
+
+  const handleSelectComplexity = (complexity: Complexity) => {
+    clearPricePrediction();
+    setSelectedComplexity(complexity);
+    setDimensions((current) => refitDimensions(current, complexity, selectedPlacement));
+  };
+
+  const handleSelectPlacement = (placement: string) => {
+    clearPricePrediction();
+    setSelectedPlacement(placement);
+    setPlacementSearch('');
+    setShowPlacementOptions(false);
+    setDimensions((current) => refitDimensions(current, selectedComplexity, placement));
   };
 
   const handleApplyPriceExample = (example: PriceExample) => {
     handleSelectLocation(example.location);
     clearPricePrediction();
     setSelectedBodyArea('');
-    setSelectedSize(example.size);
+    setDimensions(example.dimensions);
     setSelectedPlacement(example.placement);
     setPlacementSearch('');
     setSelectedComplexity(example.complexity);
-    setSelectedDesignType(example.designType);
     setSelectedColor(example.color);
   };
 
@@ -355,12 +422,6 @@ export default function Home() {
 
     clearPricePrediction();
     setIsPredictingPrice(true);
-    const complexityScore: Record<string, number> = {
-      Simple: 1,
-      Medium: 2,
-      Complex: 3,
-    };
-    const colorCount = selectedColor === 'black-and-grey' ? 1 : selectedColor === 'limited-color' ? 2 : 5;
 
     try {
       const response = await fetch(`${API_BASE_URL}/api/price/predict`, {
@@ -369,15 +430,13 @@ export default function Home() {
         body: JSON.stringify({
           country: 'India',
           city: selectedLocation,
-          size_sq_inches: sizeAreaEstimates[selectedSize],
-          body_part: selectedPlacement,
-          tattoo_style: 'Realism',
-          complexity: complexityScore[selectedComplexity],
-          is_color: selectedColor === 'black-and-grey' ? 0 : 1,
-          color_count: colorCount,
-          shading_level: complexityScore[selectedComplexity],
-          artist_level: 'Established',
-          design_type: selectedDesignType,
+          state: selectedLocationOption?.state,
+          location_type: selectedLocationOption?.locationType,
+          width_in: dimensions.width,
+          height_in: dimensions.height,
+          complexity: selectedComplexity,
+          color: selectedColor,
+          placement: selectedPlacement,
         }),
       });
       const result = await response.json() as DatasetPricePrediction & { detail?: string };
@@ -444,7 +503,13 @@ export default function Home() {
     clearPricePrediction();
     setPendingGeneratedImage(imageUrl);
     setSelectedComplexity(metadata.complexity);
-    setSelectedColor(metadata.color === 'Colored' ? 'full-color' : 'black-and-grey');
+    setSelectedColor(metadata.color);
+    // Match the image's shape and start at the dataset's recommended size for its complexity.
+    setDimensions(recommendedDimensions(
+      nearestProportion(metadata.pixel_width, metadata.pixel_height),
+      metadata.complexity,
+      selectedPlacement,
+    ));
   };
 
   const handleRandomImageRequest = async () => {
@@ -516,11 +581,8 @@ export default function Home() {
             return;
           }
           const resolvedCity = resolveIndianCity(city) ?? city;
-          clearPricePrediction();
-          setSelectedLocation(resolvedCity);
-          setQuery(resolvedCity);
+          handleSelectLocation(resolvedCity);
           setGeoStatus(`Using your current location: ${resolvedCity}, India.`);
-          setShowSuggestions(false);
         } catch (error) {
           console.error('Unable to determine the current city from GPS coordinates.', error);
           setGeoStatus('Could not look up your GPS location. Enter an Indian city instead.');
@@ -573,6 +635,7 @@ export default function Home() {
                       clearPricePrediction();
                       setQuery(event.target.value);
                       setSelectedLocation('');
+                      setSelectedLocationOption(null);
                       setShowSuggestions(true);
                     }}
                     onFocus={() => setShowSuggestions(true)}
@@ -595,12 +658,12 @@ export default function Home() {
                             key={`${option.label}-${option.value}`}
                             type="button"
                             onMouseDown={(event) => event.preventDefault()}
-                            onClick={() => handleSelectLocation(option.value)}
+                            onClick={() => handleSelectLocation(option.value, option)}
                             className="flex w-full items-center justify-between border-b border-[#f1f1f1] px-3 py-2.5 text-left text-sm text-[#2a2a2a] last:border-b-0 hover:bg-[#f9f9f9]"
                           >
                             <span>{option.label}</span>
                             <span className="rounded-full bg-[#f0f0f0] px-2 py-0.5 text-[10px] uppercase tracking-[0.12em] text-[#5f5f5f]">
-                              City
+                              {option.kind}
                             </span>
                           </button>
                         ))
@@ -630,7 +693,7 @@ export default function Home() {
                   </button>
 
                   {selectedLocation && (
-                    <span className="text-[11px] font-medium text-[#2d2d2d]">Selected: {selectedLocation}</span>
+                    <span className="text-[11px] font-medium text-[#2d2d2d]">Selected: {selectedLocationOption?.label ?? selectedLocation}</span>
                   )}
                 </div>
 
@@ -747,29 +810,18 @@ export default function Home() {
                 {uploadedImage && <p className="mt-2 text-xs text-[#666]">Use the image as a visual reference while completing the tattoo details.</p>}
               </div>
 
-              <label className="block text-[11px] font-semibold uppercase tracking-[0.12em] text-[#666]">
-                Tattoo size
-                <select
-                  value={selectedSize}
-                  onChange={(event) => {
+              <div className="md:col-span-2">
+                <div className="mb-3 text-[11px] font-semibold uppercase tracking-[0.12em] text-[#666]">Tattoo size</div>
+                <TattooSizePicker
+                  value={dimensions}
+                  complexity={selectedComplexity}
+                  placement={selectedPlacement}
+                  onChange={(next) => {
                     clearPricePrediction();
-                    setSelectedSize(event.target.value);
+                    setDimensions(next);
                   }}
-                  className="mt-2 w-full rounded-lg border border-[#d4d4d4] bg-white px-3 py-3 text-[15px] text-[#282828] outline-none ring-0 transition focus:border-[#999]"
-                >
-                  <option value="" disabled>Select size</option>
-                  <option value="tiny">Tiny / 2 x 2 in</option>
-                  <option value="small">Small / 3 x 3 in</option>
-                  <option value="medium">Medium / 4 x 4 in</option>
-                  <option value="large">Large / 5 x 5 in</option>
-                  <option value="small-custom">Small custom</option>
-                  <option value="medium-custom">Medium custom</option>
-                  <option value="large-standalone">Large standalone</option>
-                  <option value="half-sleeve">Half sleeve</option>
-                  <option value="full-sleeve">Full sleeve</option>
-                  <option value="full-back">Full back</option>
-                </select>
-              </label>
+                />
+              </div>
 
               <div className="block text-[11px] font-semibold uppercase tracking-[0.12em] text-[#666]">
                 <label htmlFor="placement-search">Body placement</label>
@@ -797,10 +849,7 @@ export default function Home() {
                       if (event.key === 'Escape') setShowPlacementOptions(false);
                       if (event.key === 'Enter' && filteredPlacementSections[0]?.options[0]) {
                         event.preventDefault();
-                        clearPricePrediction();
-                        setSelectedPlacement(filteredPlacementSections[0].options[0]);
-                        setPlacementSearch('');
-                        setShowPlacementOptions(false);
+                        handleSelectPlacement(filteredPlacementSections[0].options[0]);
                       }
                     }}
                     placeholder={selectedBodyArea ? `Choose a placement in ${selectedBodyArea}...` : 'Search placements...'}
@@ -819,12 +868,7 @@ export default function Home() {
                               role="option"
                               aria-selected={selectedPlacement === option}
                               onMouseDown={(event) => event.preventDefault()}
-                              onClick={() => {
-                                clearPricePrediction();
-                                setSelectedPlacement(option);
-                                setPlacementSearch('');
-                                setShowPlacementOptions(false);
-                              }}
+                              onClick={() => handleSelectPlacement(option)}
                               className="block w-full px-3 py-1.5 text-left text-sm font-normal normal-case tracking-normal text-[#252525] hover:bg-[#f3f3f3]"
                             >
                               {option}
@@ -845,14 +889,13 @@ export default function Home() {
                   value={selectedColor}
                   onChange={(event) => {
                     clearPricePrediction();
-                    setSelectedColor(event.target.value);
+                    setSelectedColor(event.target.value as TattooColor);
                   }}
                   className="mt-2 w-full rounded-lg border border-[#d4d4d4] bg-white px-3 py-3 text-[15px] text-[#282828] outline-none ring-0 transition focus:border-[#999]"
                 >
                   <option value="" disabled>Select color</option>
-                  <option value="black-and-grey">Black and grey</option>
-                  <option value="limited-color">Limited color</option>
-                  <option value="full-color">Full color</option>
+                  <option value="Black_Gray">Black and grey</option>
+                  <option value="Colored">Color</option>
                 </select>
               </label>
             </div>
@@ -867,10 +910,7 @@ export default function Home() {
                     key={option}
                     type="button"
                     aria-pressed={selectedComplexity === option}
-                    onClick={() => {
-                      clearPricePrediction();
-                      setSelectedComplexity(option);
-                    }}
+                    onClick={() => handleSelectComplexity(option)}
                     className={`rounded-lg border px-3 py-2.5 text-sm font-medium transition ${
                       selectedComplexity === option
                         ? 'border-[#2e2e2e] bg-[#fbfbfb] text-[#1d1d1d] shadow-sm'
@@ -894,7 +934,9 @@ export default function Home() {
             {pricePredictionError && <p role="alert" className="mt-2 text-center text-xs text-red-700">{pricePredictionError}</p>}
             {!estimateInputsComplete && (
               <p className="mt-2 text-center text-xs text-[#666]">
-                Complete location, size, placement, and color to calculate.
+                {sizeErrors.length > 0
+                  ? 'Fix the tattoo size above to calculate.'
+                  : 'Complete location, placement, and color to calculate.'}
               </p>
             )}
           </div>
@@ -925,27 +967,20 @@ export default function Home() {
                 <div>
                   <p className="text-center text-xs font-medium uppercase tracking-[0.12em] text-[#6b6b6b]">Estimated tattoo price</p>
                   <p className="mt-1 text-center text-3xl font-bold tracking-[-0.04em] text-[#171717]">
-                    {formatEstimatePrice(datasetPricePrediction.predicted_price_mid)}
+                    {formatInr(datasetPricePrediction.predicted_price_mid)}
                   </p>
                   <p className="mt-1 text-center text-sm text-[#555]">
-                    {formatEstimatePrice(datasetPricePrediction.predicted_price_min)} - {formatEstimatePrice(datasetPricePrediction.predicted_price_max)}
+                    {formatInr(datasetPricePrediction.predicted_price_min)} - {formatInr(datasetPricePrediction.predicted_price_max)}
                   </p>
 
                   <div className="mt-4 border-t border-[#e7e7e7] pt-3">
                     <h3 className="text-xs font-semibold text-[#333]">Included pricing factors</h3>
                     <ul className="mt-2 space-y-1 text-xs leading-4 text-[#666]">
-                      {datasetPricePrediction.factors
-                        .filter((factor) => !factor.toLowerCase().includes('amounts are usd'))
-                        .map((factor) => <li key={factor}>{factor}</li>)}
-                      <li>Displayed in Indian rupees (INR)</li>
+                      {datasetPricePrediction.factors.map((factor) => <li key={factor}>{factor}</li>)}
                     </ul>
                   </div>
                   <p className="mt-4 text-[11px] leading-4 text-[#777]">
-                    Prices shown in Indian rupees (INR). {exchangeRateFailed
-                      ? 'A fallback exchange rate is being used.'
-                      : !isExchangeRateLoaded
-                        ? 'Loading the latest INR exchange rate.'
-                        : 'Converted using the latest INR exchange rate.'}
+                    Prices in Indian rupees (INR). Estimated from published and estimated studio rates; confirm with your artist for a quote.
                   </p>
                 </div>
               ) : (
@@ -965,7 +1000,7 @@ export default function Home() {
               <div className="mt-4 flex flex-wrap justify-center gap-1.5">
                 {[
                   { label: 'Location', complete: Boolean(selectedLocation) },
-                  { label: 'Size and placement', complete: Boolean(selectedSize && selectedPlacement) },
+                  { label: 'Size and placement', complete: Boolean(selectedPlacement && sizeErrors.length === 0) },
                   { label: 'Design details', complete: Boolean(selectedComplexity && selectedColor) },
                 ].map(({ label, complete }) => (
                   <span

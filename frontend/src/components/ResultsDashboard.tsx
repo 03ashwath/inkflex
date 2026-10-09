@@ -1,5 +1,5 @@
 import React from 'react';
-import { formatInr, useUsdToInrRate } from '@/lib/currency';
+import { formatInr } from '@/lib/currency';
 
 export type ResultsDashboardData = {
   price_prediction: {
@@ -21,7 +21,7 @@ export type ResultsDashboardData = {
   skinTone?: string;
   inkColor?: string;
   inkBrand?: string;
-  sizeCategory?: string;
+  sizeLabel?: string;
   nearby_studios?: Array<{ name: string; distance: string; rating: number; address: string }>;
 };
 
@@ -36,9 +36,9 @@ export default function ResultsDashboard({ data }: { data: ResultsDashboardData 
   };
 
   const price: ResultsDashboardData['price_prediction'] = data?.price_prediction || {
-    predicted_price_mid: 250,
-    predicted_price_min: 200,
-    predicted_price_max: 300,
+    predicted_price_mid: 13500,
+    predicted_price_min: 9000,
+    predicted_price_max: 18000,
     factors: ["Medium size", "Moderate complexity", "Local studio averages"]
   };
 
@@ -93,9 +93,6 @@ export default function ResultsDashboard({ data }: { data: ResultsDashboardData 
               ? 'blue'
               : 'currentColor')
     : 'currentColor';
-
-  const { rate: usdToInrRate, isLoaded: isExchangeRateLoaded, hasError: exchangeRateFailed } = useUsdToInrRate();
-  const formatPrice = (val: number) => formatInr(val, usdToInrRate);
 
   return (
     <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-700 text-left">
@@ -157,16 +154,9 @@ export default function ResultsDashboard({ data }: { data: ResultsDashboardData 
         </h3>
         <div className="text-center py-6">
           <div className="text-5xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-green-400 to-emerald-600 mb-2">
-            {formatPrice(price.predicted_price_min)} - {formatPrice(price.predicted_price_max)}
+            {formatInr(price.predicted_price_min)} - {formatInr(price.predicted_price_max)}
           </div>
-          <p className="text-slate-400">Estimated Average: <span className="text-slate-200 font-bold">{formatPrice(price.predicted_price_mid)}</span></p>
-          {(exchangeRateFailed || !isExchangeRateLoaded) && (
-            <p role="status" className="mt-2 text-xs text-amber-300">
-              {exchangeRateFailed
-                ? 'Approximate INR conversion is being used.'
-                : 'Loading the latest INR exchange rate.'}
-            </p>
-          )}
+          <p className="text-slate-400">Estimated Average: <span className="text-slate-200 font-bold">{formatInr(price.predicted_price_mid)}</span></p>
         </div>
         <div className="bg-slate-800/50 rounded-xl p-4 mt-4">
           <h4 className="text-sm font-bold text-slate-300 mb-2 uppercase tracking-wider">Key Pricing Factors</h4>
