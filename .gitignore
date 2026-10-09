@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+backend/venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment / secrets
+.env
+.env.*
+*.env
+
+# Node / Next.js
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.turbo/
+
+# Build outputs
+build/
+dist/
+coverage/
+*.log
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Large optional dataset downloads
+dataset/Tattoo_image_500/
+dataset/Tattoo_img_200/
+ml/data/tattoo_200_image.csv
+ml/data/tattoo_price_training_india_100k_clean.csv
+*.zip
+
+# Model artifacts (optional local cache)
+ml/saved_models/
