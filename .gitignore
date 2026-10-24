@@ -40,6 +40,9 @@ dataset/Tattoo_image_500/
 dataset/Tattoo_img_200/
 ml/data/tattoo_200_image.csv
 ml/data/tattoo_price_training_india_100k_clean.csv
+ml/data/tattoo_price_dataset_india_image_location.csv
+ml/data/Tattoo_img_200/
+ml/data/processed/
 *.zip
 
 # Model artifacts (optional local cache)

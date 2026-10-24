@@ -1,5 +1,6 @@
 import React from 'react';
 import { formatInr } from '@/lib/currency';
+import { getApiErrorMessage } from '@/lib/api-errors';
 
 export type ResultsDashboardData = {
   price_prediction: {
@@ -57,9 +58,9 @@ export default function ResultsDashboard({ data }: { data: ResultsDashboardData 
     const fetchImages = async () => {
       try {
         const response = await fetch(`${API_BASE_URL}/api/images/random`);
-        const result = await response.json() as { images?: unknown; detail?: string };
+        const result = await response.json() as { images?: unknown; detail?: unknown };
         if (!response.ok) {
-          throw new Error(result.detail || `Image request failed with status ${response.status}.`);
+          throw new Error(getApiErrorMessage(result, `Image request failed with status ${response.status}.`));
         }
         if (!Array.isArray(result.images) || result.images.length !== 6 || !result.images.every((url): url is string => typeof url === 'string')) {
           throw new Error('The local image dataset did not return six valid images.');

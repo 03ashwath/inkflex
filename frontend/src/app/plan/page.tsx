@@ -4,6 +4,7 @@ import { useState } from 'react';
 import Link from 'next/link';
 import ResultsDashboard, { type ResultsDashboardData } from '@/components/ResultsDashboard';
 import TattooSizePicker from '@/components/TattooSizePicker';
+import { getApiErrorMessage } from '@/lib/api-errors';
 import { INDIAN_CITIES, INDIAN_CITY_ALIASES, resolveIndianCity } from '@/lib/indian-cities';
 import {
   PROPORTIONS,
@@ -32,6 +33,7 @@ export default function PlanPage() {
 
   const [showResults, setShowResults] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [apiError, setApiError] = useState('');
   const [locationStatus, setLocationStatus] = useState('');
   const [resultsData, setResultsData] = useState<ResultsDashboardData | null>(null);
   const [dimensions, setDimensions] = useState<TattooDimensions>(() => recommendedDimensions(PROPORTIONS[0], 'Medium'));
@@ -42,6 +44,7 @@ export default function PlanPage() {
 
   const fetchResults = async () => {
     setIsLoading(true);
+    setApiError('');
     try {
       const modelCountry = 'IN';
       const enteredCity = formData.city.trim();
@@ -73,9 +76,9 @@ export default function PlanPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
-      const responseData = await res.json() as ResultsDashboardData['price_prediction'] & { detail?: string };
+      const responseData = await res.json() as ResultsDashboardData['price_prediction'] & { detail?: unknown };
       if (!res.ok) {
-        throw new Error(responseData.detail || 'Unable to estimate the tattoo price.');
+        throw new Error(getApiErrorMessage(responseData, 'Unable to estimate the tattoo price.'));
       }
       const priceData: ResultsDashboardData['price_prediction'] = responseData;
 
@@ -101,20 +104,10 @@ export default function PlanPage() {
       setShowResults(true);
     } catch (error) {
       console.error(error);
-      // Fallback if backend fails
-      setResultsData({
-        price_prediction: {
-          predicted_price_mid: 13500,
-          predicted_price_min: 9000,
-          predicted_price_max: 18000,
-          factors: ["Price service unavailable; showing a typical range", `Size: ${sizeLabel}`, `Location: ${formData.city}, India`]
-        },
-        health_assessment: { category: "Lower concern", factors: [], explanation: "Fallback", sources: [] },
-        designText: formData.designType === 'text' && formData.designText.trim() ? formData.designText : `${formData.inkColor !== 'No Preference' ? formData.inkColor + ' ' : ''}${sizeLabel} tattoo design`, city: formData.city, country: 'India', countryCode: 'IN', skinTone: formData.skinTone, inkColor: formData.inkColor, sizeLabel
-      });
-      setShowResults(true);
+      setApiError(error instanceof Error ? error.message : 'Unable to connect to the price service.');
+    } finally {
+      setIsLoading(false);
     }
-    setIsLoading(false);
   };
 
 
@@ -406,6 +399,7 @@ export default function PlanPage() {
                    className="px-8 py-4 bg-gradient-to-r from-purple-600 to-blue-600 text-white font-bold rounded-full hover:shadow-lg hover:shadow-purple-500/30 transition-all hover:-translate-y-1 disabled:opacity-50 disabled:cursor-not-allowed">
                    {isLoading ? 'Analyzing...' : 'Generate My Tattoo Plan'}
                  </button>
+                 {apiError && <p role="alert" className="mt-4 text-sm text-red-300">{apiError}</p>}
               </div>
             ) : (
               <ResultsDashboard data={resultsData} />

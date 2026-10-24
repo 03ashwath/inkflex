@@ -1,108 +1,178 @@
-import os
+"""Train the tattoo price model on the prepared India image/location dataset.
+
+Run ml/preprocessing/prepare_dataset.py first. The model predicts log per-sq-in rates
+(min, mid, max); ml/pricing.py turns those into prices for any width x height.
+
+Two held-out evaluations are reported before the final fit on all data:
+  unseen locations   20% of locations are held out entirely
+  size extrapolation train on sizes up to 4x4 in, test on 5x5 in
+"""
+
+import json
+import sys
+import time
+from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import train_test_split
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.model_selection import GroupShuffleSplit
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import OneHotEncoder, TargetEncoder
 
-DATA_PATH = os.getenv(
-    "TATTOO_PRICE_DATASET_READY",
-    r"C:\Users\Vikheyath R Bangera\Desktop\Reserch paper dataset\tattoo_price_training_india_100k_clean.csv",
-)
-ALT_DATA_PATH = os.getenv(
-    "TATTOO_PRICE_DATASET_RAW",
-    r"C:\Users\Vikheyath R Bangera\Desktop\Reserch paper dataset\tattoo_price_training_india_100k_clean.csv",
-)
-MODEL_PATH = os.path.join(
-    os.path.dirname(__file__), "saved_models", "price_prediction_model.joblib"
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT.parent))
+
+from ml.pricing import (  # noqa: E402
+    NUMERIC_FEATURES, ONE_HOT_FEATURES, RATE_TARGETS, TARGET_ENCODED_FEATURES, UNKNOWN, build_features, round_price,
 )
 
-NUMERICAL_FEATURES = ["area_sq_in", "complexity_score"]
-CATEGORICAL_FEATURES = ["country", "city", "placement", "style", "color_type", "artist_level", "design_type"]
-MODEL_FEATURES = NUMERICAL_FEATURES + CATEGORICAL_FEATURES
+PROCESSED_DIR = ROOT / "data" / "processed"
+MODEL_PATH = ROOT / "saved_models" / "price_model_v2.joblib"
+METRICS_PATH = ROOT / "saved_models" / "price_model_v2_metrics.json"
+PRICE_BANDS = [0, 5_000, 20_000, np.inf]
+PRICE_BAND_LABELS = ["< INR 5k", "INR 5k-20k", "> INR 20k"]
 
-def print_price_group_metrics(actual, predictions):
-    results = pd.DataFrame({"actual": actual.to_numpy(), "predicted": predictions})
-    results["absolute_error"] = (results["actual"] - results["predicted"]).abs()
-    results["absolute_percentage_error"] = results["absolute_error"] / results["actual"] * 100
-    results["price_group"] = pd.cut(results["actual"], bins=[0, 250, 1000, np.inf], labels=["Low (<$250)", "Medium ($250-$1,000)", "High (>$1,000)"], include_lowest=True)
-    print("\nPrice-group error analysis:")
-    for group in results["price_group"].cat.categories:
-        group_data = results[results["price_group"] == group]
-        if group_data.empty:
-            print(f"{group}: no test records")
-            continue
-        absolute_error = group_data["absolute_error"]
-        print(f"{group}: n={len(group_data):,}, MAE=${absolute_error.mean():.2f}, RMSE=${np.sqrt(np.mean(absolute_error ** 2)):.2f}, Median AE=${absolute_error.median():.2f}, MAPE={group_data['absolute_percentage_error'].mean():.2f}%")
+
+def make_model() -> Pipeline:
+    preprocessor = ColumnTransformer([
+        ("target", TargetEncoder(target_type="continuous", random_state=42), TARGET_ENCODED_FEATURES),
+        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False), ONE_HOT_FEATURES),
+        ("numeric", "passthrough", NUMERIC_FEATURES),
+    ])
+    regressor = HistGradientBoostingRegressor(max_iter=400, learning_rate=0.08, max_leaf_nodes=31, random_state=42)
+    return Pipeline([("preprocessor", preprocessor), ("model", regressor)])
+
+
+def fit_rate_models(rates: pd.DataFrame) -> dict:
+    models = {}
+    for name in RATE_TARGETS:
+        rows = rates[~rates[f"floored_{name}"]]
+        model = make_model()
+        print(
+            f"  Training {name} rate model: {len(rows):,} rows "
+            f"({len(rates) - len(rows):,} minimum-charge rows excluded)...",
+            flush=True,
+        )
+        started = time.perf_counter()
+        model.fit(build_features(rows), np.log(rows[f"rate_{name}"]), model__sample_weight=rows["weight"])
+        print(f"  Finished {name} rate model in {time.perf_counter() - started:.1f}s", flush=True)
+        models[name] = model
+    return models
+
+
+def predict_prices(models: dict, rows: pd.DataFrame, min_charge: pd.Series) -> pd.DataFrame:
+    features = build_features(rows)
+    rates = np.sort(np.column_stack([np.exp(models[name].predict(features)) for name in ("min", "mid", "max")]), axis=1)
+    out = {}
+    for index, name in enumerate(("min", "mid", "max")):
+        raw = np.maximum(rates[:, index] * rows["area_sq_in"].to_numpy(), min_charge.to_numpy())
+        out[name] = [round_price(value) for value in raw]
+    return pd.DataFrame(out, index=rows.index)
+
+
+def price_metrics(actual: pd.Series, predicted: pd.DataFrame, weight: pd.Series, low: pd.Series, high: pd.Series) -> dict:
+    error = (predicted["mid"] - actual).abs()
+    pct = error / actual * 100
+    covered = (predicted["mid"] >= low) & (predicted["mid"] <= high)
+    metrics = {
+        "rows": int(weight.sum()),
+        "mae_inr": float(np.average(error, weights=weight)),
+        "mape_pct": float(np.average(pct, weights=weight)),
+        "r2": float(r2_score(actual, predicted["mid"], sample_weight=weight)),
+        "mid_within_dataset_range_pct": float(np.average(covered, weights=weight) * 100),
+        "by_price_band": {},
+    }
+    bands = pd.cut(actual, PRICE_BANDS, labels=PRICE_BAND_LABELS)
+    for label in PRICE_BAND_LABELS:
+        mask = bands == label
+        if mask.any():
+            metrics["by_price_band"][label] = {
+                "rows": int(weight[mask].sum()),
+                "mae_inr": float(np.average(error[mask], weights=weight[mask])),
+                "mape_pct": float(np.average(pct[mask], weights=weight[mask])),
+            }
+    return metrics
+
+
+def fallback_min_charge(train_locations: pd.DataFrame, test_rows: pd.DataFrame) -> pd.Series:
+    """Minimum charge for locations the model has never seen: the state median, else the overall median."""
+    by_state = train_locations.groupby("state_ut")["minimum_studio_charge_inr"].median()
+    overall = train_locations["minimum_studio_charge_inr"].median()
+    return test_rows["state_ut"].map(by_state).fillna(overall)
+
+
+def evaluate_unseen_locations(rates: pd.DataFrame, locations: pd.DataFrame) -> dict:
+    splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+    train_index, test_index = next(splitter.split(rates, groups=rates["location_key"]))
+    train, test = rates.iloc[train_index], rates.iloc[test_index].copy()
+    models = fit_rate_models(train)
+    test["location_key"] = UNKNOWN
+    train_locations = locations[locations["location_key"].isin(train["location_key"])]
+    predicted = predict_prices(models, test, fallback_min_charge(train_locations, test))
+    return price_metrics(test["accurate_price_inr"], predicted, test["weight"], test["min_price_inr"], test["max_price_inr"])
+
+
+def evaluate_size_extrapolation(rates: pd.DataFrame) -> dict:
+    train, test = rates[rates["area_sq_in"] <= 16], rates[rates["area_sq_in"] > 16]
+    models = fit_rate_models(train)
+    predicted = predict_prices(models, test, test["minimum_studio_charge_inr"])
+    return price_metrics(test["accurate_price_inr"], predicted, test["weight"], test["min_price_inr"], test["max_price_inr"])
+
+
+def print_metrics(title: str, metrics: dict) -> None:
+    print(f"\n{title} (n={metrics['rows']:,})")
+    print(f"  MAE: INR {metrics['mae_inr']:,.0f}   MAPE: {metrics['mape_pct']:.2f}%   R2: {metrics['r2']:.4f}")
+    print(f"  Mid estimate inside the dataset min-max range: {metrics['mid_within_dataset_range_pct']:.1f}%")
+    for label, band in metrics["by_price_band"].items():
+        print(f"  {label:>8}: n={band['rows']:,}  MAE=INR {band['mae_inr']:,.0f}  MAPE={band['mape_pct']:.2f}%")
+
 
 def train_model() -> None:
-    if not os.path.isfile(DATA_PATH):
-        raise FileNotFoundError(f"Training dataset not found: {DATA_PATH}")
-    data = pd.read_csv(DATA_PATH)
+    print("Loading prepared training data...", flush=True)
+    for name in ("rates.csv", "locations.csv", "images.csv"):
+        if not (PROCESSED_DIR / name).is_file():
+            raise FileNotFoundError(f"{PROCESSED_DIR / name} not found; run ml/preprocessing/prepare_dataset.py first.")
+    rates = pd.read_csv(PROCESSED_DIR / "rates.csv")
+    locations = pd.read_csv(PROCESSED_DIR / "locations.csv")
+    images = pd.read_csv(PROCESSED_DIR / "images.csv")
+    print(
+        f"Loaded {len(rates):,} rate rows, {len(locations):,} locations, "
+        f"and {len(images):,} images.",
+        flush=True,
+    )
 
-    if {"price_usd"}.issubset(data.columns):
-        required_columns = set(MODEL_FEATURES + ["price_usd"])
-        missing_columns = required_columns.difference(data.columns)
-        if missing_columns:
-            raise ValueError(f"Training dataset is missing required columns: {sorted(missing_columns)}")
-        training_data = data[MODEL_FEATURES + ["price_usd"]].copy()
-    else:
-        size_to_placement = {
-            'tiny': 'Wrist',
-            'small': 'Wrist',
-            'medium': 'Forearm',
-            'large': 'Forearm',
-            'small-custom': 'Forearm',
-            'medium-custom': 'Forearm',
-            'large-standalone': 'Forearm',
-            'half-sleeve': 'Half Sleeve',
-            'full-sleeve': 'Full Sleeve',
-            'full-back': 'Back',
-        }
-        complexity_map = {'Simple': 1, 'Medium': 2, 'Complex': 3, 'Intricate': 4}
-        training_data = pd.DataFrame({
-            'area_sq_in': pd.to_numeric(data['area_sq_in'], errors='coerce'),
-            'country': 'India',
-            'city': data['city'].astype('string').str.strip(),
-            'placement': data['size_id'].map(size_to_placement).fillna('Forearm'),
-            'style': np.where(data['color'].astype('string').str.contains('Gray|Black', case=False, na=False), 'Blackwork', 'Realism'),
-            'complexity_score': data['complexity'].map(complexity_map).fillna(2),
-            'color_type': np.where(data['color'].astype('string').str.contains('Gray|Black', case=False, na=False), 'Black and grey', 'Color'),
-            'artist_level': 'Established',
-            'design_type': np.where(data['size_id'].astype('string').str.contains('custom|standalone', case=False, na=False), 'Custom design', 'Flash design'),
-            'price_usd': pd.to_numeric(data['price_inr'], errors='coerce') / 83.0,
-        })
-        training_data = training_data[MODEL_FEATURES + ['price_usd']].copy()
+    print("\nEvaluating held-out unseen locations...", flush=True)
+    metrics = {"unseen_locations": evaluate_unseen_locations(rates, locations)}
+    print("\nEvaluating size extrapolation...", flush=True)
+    metrics["size_extrapolation"] = evaluate_size_extrapolation(rates)
+    print("\nTraining final models on all available rate data...", flush=True)
+    models = fit_rate_models(rates)
+    predicted = predict_prices(models, rates, rates["minimum_studio_charge_inr"])
+    metrics["training_fit"] = price_metrics(rates["accurate_price_inr"], predicted, rates["weight"], rates["min_price_inr"], rates["max_price_inr"])
 
-    training_data['price_usd'] = pd.to_numeric(training_data['price_usd'], errors='coerce')
-    training_data = training_data.replace([np.inf, -np.inf], np.nan).dropna()
-    training_data = training_data[training_data['price_usd'] > 0]
-    if training_data.empty:
-        raise ValueError("Training dataset has no valid positive USD prices.")
-    features = training_data[MODEL_FEATURES]
-    target = training_data["price_usd"]
-    preprocessor = ColumnTransformer(transformers=[("numeric", "passthrough", NUMERICAL_FEATURES), ("categorical", OneHotEncoder(handle_unknown="ignore"), CATEGORICAL_FEATURES)])
-    model = Pipeline(steps=[("preprocessor", preprocessor), ("model", RandomForestRegressor(n_estimators=200, min_samples_leaf=3, max_features=0.8, n_jobs=-1, random_state=42))])
-    X_train, X_test, y_train, y_test = train_test_split(features, target, test_size=0.2, random_state=42)
-    model.fit(X_train, y_train)
-    predictions = model.predict(X_test)
-    overall_mae = mean_absolute_error(y_test, predictions)
-    overall_rmse = np.sqrt(mean_squared_error(y_test, predictions))
-    overall_r2 = r2_score(y_test, predictions)
-    print(f"Training records: {len(training_data):,}")
-    print(f"Mean absolute error (USD): {overall_mae:.2f}")
-    print(f"Root mean squared error (USD): {overall_rmse:.2f}")
-    print(f"R-squared: {overall_r2:.4f}")
-    print(f"RMSE/MAE ratio: {overall_rmse / overall_mae:.2f}")
-    print_price_group_metrics(y_test, predictions)
-    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
-    joblib.dump(model, MODEL_PATH)
-    print(f"Model saved to {MODEL_PATH}")
+    print(f"Rate rows: {len(rates):,} representing {int(rates['weight'].sum()):,} source rows")
+    print_metrics("Held-out unseen locations", metrics["unseen_locations"])
+    print_metrics("Size extrapolation (train <=4x4 in, test 5x5 in)", metrics["size_extrapolation"])
+    print_metrics("Fit on all training data", metrics["training_fit"])
+
+    bundle = {
+        "version": 2,
+        "models": models,
+        "locations": locations.replace({np.nan: None}).to_dict("records"),
+        "images": images.replace({np.nan: None}).to_dict("records"),
+        "metrics": metrics,
+    }
+    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    print("\nSaving trained model and metrics...", flush=True)
+    joblib.dump(bundle, MODEL_PATH)
+    METRICS_PATH.write_text(json.dumps(metrics, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"\nModel saved to {MODEL_PATH}")
+    print(f"Metrics saved to {METRICS_PATH}", flush=True)
+
 
 if __name__ == "__main__":
     train_model()

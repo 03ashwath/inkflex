@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import BodyAreaPicker from '../components/BodyAreaPicker';
 import TattooSizePicker from '../components/TattooSizePicker';
 import { formatInr } from '../lib/currency';
+import { getApiErrorMessage } from '../lib/api-errors';
 import { INDIAN_CITIES, INDIAN_CITY_ALIASES, resolveIndianCity } from '../lib/indian-cities';
 import {
   PROPORTIONS,
@@ -439,9 +440,9 @@ export default function Home() {
           placement: selectedPlacement,
         }),
       });
-      const result = await response.json() as DatasetPricePrediction & { detail?: string };
+      const result = await response.json() as DatasetPricePrediction & { detail?: unknown };
       if (!response.ok) {
-        throw new Error(result.detail || `Price prediction failed with status ${response.status}.`);
+        throw new Error(getApiErrorMessage(result, `Price prediction failed with status ${response.status}.`));
       }
       if (
         !Number.isFinite(result.predicted_price_min) ||
@@ -521,9 +522,9 @@ export default function Home() {
 
     try {
       const response = await fetch(`${API_BASE_URL}/api/images/random`);
-      const result = await response.json() as { images?: unknown; metadata?: unknown; detail?: string };
+      const result = await response.json() as { images?: unknown; metadata?: unknown; detail?: unknown };
       if (!response.ok) {
-        throw new Error(result.detail || `Image request failed with status ${response.status}.`);
+        throw new Error(getApiErrorMessage(result, `Image request failed with status ${response.status}.`));
       }
       if (!Array.isArray(result.images) || result.images.length !== 6 || !result.images.every((url): url is string => typeof url === 'string')) {
         throw new Error('The local image dataset did not return six valid images.');

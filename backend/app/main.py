@@ -1,21 +1,28 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi import status
+from pathlib import Path
 import random
 import joblib
 import os
-import csv
+import sys
 import pandas as pd
-import urllib.parse
-import numpy as np
 
-from app.schemas.api_schemas import PricePredictionResult, HealthInputSchema, HealthAssessmentResult
+from app.schemas.api_schemas import (
+    PricePredictionRequest,
+    PricePredictionResult,
+    LocationOption,
+    HealthInputSchema,
+    HealthAssessmentResult,
+)
 from app.services.agents.health_agent import HealthAgent
-from pydantic import BaseModel
 
-app = FastAPI(title="Tattoo AI API", version="1.0.0")
-api_base_url = f"http://localhost:{os.getenv('PORT', '8001')}"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
+from ml.pricing import TattooPricer, validate_dimensions  # noqa: E402
+
+app = FastAPI(title="Tattoo AI API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,44 +34,51 @@ app.add_middleware(
 
 reference_dataset_path = os.getenv(
     "TATTOO_IMAGE_DATASET",
-    r"C:\Users\Vikheyath R Bangera\Desktop\Reserch paper dataset\Tattoo_img_200",
-)
-reference_image_metadata_path = os.getenv(
-    "TATTOO_IMAGE_METADATA",
-    r"C:\Users\Vikheyath R Bangera\Desktop\Reserch paper dataset\tattoo_200_image.csv",
+    str(PROJECT_ROOT / "ml" / "data" / "Tattoo_img_200"),
 )
 if os.path.isdir(reference_dataset_path):
     app.mount("/reference-dataset", StaticFiles(directory=reference_dataset_path), name="reference-dataset")
 
-# Load the ML model
-model_path = os.path.join(os.path.dirname(__file__), '../../ml/saved_models/price_prediction_model.joblib')
+# Load the ML model bundle written by ml/train.py
+model_path = os.getenv("TATTOO_PRICE_MODEL", str(PROJECT_ROOT / "ml" / "saved_models" / "price_model_v2.joblib"))
 try:
-    price_model = joblib.load(model_path)
+    pricer = TattooPricer(joblib.load(model_path))
     print("Price prediction model loaded successfully.")
 except Exception as e:
     print(f"Warning: Could not load model at {model_path}. Error: {e}")
-    price_model = None
+    pricer = None
 
 # Initialize AI Agents
 health_agent = HealthAgent()
 
-class PricePredictionRequest(BaseModel):
-    country: str
-    city: str
-    size_sq_inches: float
-    body_part: str
-    tattoo_style: str
-    complexity: int
-    is_color: int
-    color_count: int
-    shading_level: int
-    ink_brand: str = "No Preference"
-    artist_level: str = "Established"
-    design_type: str = "Custom design"
+COLOR_LABELS = {"Black_Gray": "Black and grey", "Colored": "Color"}
+
+
+def require_pricer() -> TattooPricer:
+    if pricer is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The tattoo price prediction model is unavailable.",
+        )
+    return pricer
+
 
 @app.get("/")
 def read_root():
     return {"message": "Welcome to the Tattoo AI API"}
+
+@app.get("/api/locations", response_model=list[LocationOption])
+def list_locations():
+    locations = require_pricer().locations
+    return [
+        LocationOption(
+            name=row["location_name"],
+            state=row["state_ut"],
+            location_type=row["location_type"],
+            parent_city=None if pd.isna(row.get("parent_city")) else row.get("parent_city"),
+        )
+        for row in locations.to_dict("records")
+    ]
 
 @app.post("/api/price/predict", response_model=PricePredictionResult)
 def predict_price(request: PricePredictionRequest):
@@ -78,162 +92,44 @@ def predict_price(request: PricePredictionRequest):
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Enter an Indian city to get a price prediction.",
         )
-    if price_model is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="The tattoo price prediction model is unavailable.",
+    size_errors = validate_dimensions(request.width_in, request.height_in, request.complexity, request.placement)
+    if size_errors:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=" ".join(size_errors))
+
+    model = require_pricer()
+    location = model.resolve_location(request.city, request.state, request.location_type)
+    estimate = model.predict(location, request.width_in, request.height_in, request.complexity, request.color)
+
+    if location["known"]:
+        place = location["location_name"]
+        if pd.notna(location.get("parent_city")) and location.get("parent_city"):
+            place += f", {location['parent_city']}"
+        location_factor = (
+            f"Location: {place}, {location['state_ut']} "
+            f"(base rate ₹{location['per_sq_in_rate_min_inr']:,.0f}-{location['per_sq_in_rate_max_inr']:,.0f} per sq in)"
         )
-
-    country = "India"
-    complexity_score = (
-        request.complexity
-        if request.complexity <= 4
-        else min(4, max(1, round(1 + (request.complexity - 1) / 3)))
-    )
-    color_type = (
-        "Black and grey"
-        if not request.is_color
-        else "Single color"
-        if request.color_count <= 1
-        else "Color"
-    )
-    placement_aliases = {
-        "arm": "Upper Arm",
-        "left upper arm": "Upper Arm",
-        "right upper arm": "Upper Arm",
-        "left bicep": "Upper Arm",
-        "right bicep": "Upper Arm",
-        "full sleeve": "Upper Arm",
-        "half sleeve": "Upper Arm",
-        "left forearm": "Forearm",
-        "right forearm": "Forearm",
-        "left inner forearm": "Forearm",
-        "right inner forearm": "Forearm",
-        "left outer forearm": "Forearm",
-        "right outer forearm": "Forearm",
-        "upper back": "Back",
-        "lower back": "Back",
-        "full back": "Back",
-        "left upper back": "Back",
-        "right upper back": "Back",
-        "left lower back": "Back",
-        "right lower back": "Back",
-        "left shoulder blade": "Back",
-        "right shoulder blade": "Back",
-        "along the spine": "Back",
-        "left side of back": "Back",
-        "right side of back": "Back",
-        "chest": "Chest & Torso",
-        "chest and torso": "Chest & Torso",
-        "upper chest": "Chest & Torso",
-        "lower chest": "Chest & Torso",
-        "left chest": "Chest & Torso",
-        "right chest": "Chest & Torso",
-        "center chest": "Chest & Torso",
-        "upper abdomen": "Chest & Torso",
-        "lower abdomen": "Chest & Torso",
-        "left side of torso": "Chest & Torso",
-        "right side of torso": "Chest & Torso",
-        "finger": "Fingers",
-        "left fingers": "Fingers",
-        "right fingers": "Fingers",
-        "left knuckles": "Fingers",
-        "right knuckles": "Fingers",
-        "left palm": "Hand",
-        "right palm": "Hand",
-        "left hand": "Hand",
-        "right hand": "Hand",
-        "left thigh": "Thigh",
-        "right thigh": "Thigh",
-        "left calf": "Calf",
-        "right calf": "Calf",
-        "left shin": "Calf",
-        "right shin": "Calf",
-        "left foot": "Foot",
-        "right foot": "Foot",
-        "top of left foot": "Foot",
-        "top of right foot": "Foot",
-        "left heel": "Foot",
-        "right heel": "Foot",
-        "left toes": "Foot",
-        "right toes": "Foot",
-        "front of neck": "Neck",
-        "left side of neck": "Neck",
-        "right side of neck": "Neck",
-        "back of neck": "Neck",
-        "behind left ear": "Neck",
-        "behind right ear": "Neck",
-        "ribs": "Ribs",
-        "left ribs": "Ribs",
-        "right ribs": "Ribs",
-        "left wrist": "Wrist",
-        "right wrist": "Wrist",
-        "left ankle": "Ankle",
-        "right ankle": "Ankle",
-        "left knee": "Knee",
-        "right knee": "Knee",
-        "sternum": "Chest & Torso",
-        "half leg": "Calf",
-        "full leg": "Calf",
-    }
-    style_aliases = {
-        "3d effect": "3D",
-        "black and grey": "Blackwork",
-    }
-    design_type_aliases = {
-        "semi-custom": "Custom from reference",
-        "fully custom": "Custom design",
-    }
-    input_data = pd.DataFrame(
-        [
-            {
-                "area_sq_in": request.size_sq_inches,
-                "complexity_score": complexity_score,
-                "country": country,
-                "city": request.city,
-                "placement": placement_aliases.get(
-                    request.body_part.strip().lower(), request.body_part.strip()
-                ),
-                "style": style_aliases.get(
-                    request.tattoo_style.strip().lower(), request.tattoo_style.strip()
-                ),
-                "color_type": color_type,
-                "artist_level": request.artist_level,
-                "design_type": design_type_aliases.get(
-                    request.design_type.strip().lower(), request.design_type
-                ),
-            }
-        ]
-    )
-
-    ink_premiums = {
-        "Kuro Sumi": 50,
-        "Xtreme Ink": 30,
-        "Eternal Ink": 20,
-        "Dynamic Color": 20,
-        "Intenze Tattoo Ink": 20,
-    }
-    ink_brand = request.ink_brand
-    ink_premium = ink_premiums.get(ink_brand, 0)
-    predicted_price = price_model.predict(input_data)[0] + ink_premium
-    forest = price_model.named_steps["model"]
-    transformed_input = price_model.named_steps["preprocessor"].transform(input_data)
-    tree_predictions = [tree.predict(transformed_input)[0] for tree in forest.estimators_]
-    min_price = max(0, round(float(np.percentile(tree_predictions, 10)) + ink_premium, 2))
-    max_price = max(
-        min_price, round(float(np.percentile(tree_predictions, 90)) + ink_premium, 2)
-    )
+    else:
+        location_factor = f"Location: {request.city.strip()} is not in the dataset; estimated from similar locations"
+    factors = [
+        f"Size: {request.width_in:g} x {request.height_in:g} in ({estimate['area_sq_in']:g} sq in)",
+        f"Complexity: {request.complexity}",
+        f"Color: {COLOR_LABELS[request.color]}",
+        location_factor,
+        f"Studio minimum charge: ₹{estimate['minimum_charge']:,.0f}",
+    ]
+    if estimate["extrapolated"]:
+        factors.append("Larger than the 5 x 5 in designs in the training data; price is scaled by area")
 
     return PricePredictionResult(
-        predicted_price_mid=round(predicted_price, 2),
-        predicted_price_min=min_price,
-        predicted_price_max=max_price,
-        factors=[
-            f"Size: {request.size_sq_inches} sq inches",
-            f"Complexity: {request.complexity}",
-            f"Location: {request.city}, {country}",
-            f"Color: {color_type}",
-        ]
+        predicted_price_min=estimate["price_min"],
+        predicted_price_mid=estimate["price_mid"],
+        predicted_price_max=estimate["price_max"],
+        width_in=request.width_in,
+        height_in=request.height_in,
+        area_sq_in=estimate["area_sq_in"],
+        location_matched=location["known"],
+        extrapolated=estimate["extrapolated"],
+        factors=factors,
     )
 
 @app.post("/api/health-analysis", response_model=HealthAssessmentResult)
@@ -242,43 +138,14 @@ def analyze_health(request: HealthInputSchema):
     return result
 
 @app.get("/api/images/random")
-def get_random_reference_images():
+def get_random_reference_images(request: Request):
     if not os.path.isdir(reference_dataset_path):
         raise HTTPException(status_code=503, detail="The tattoo reference image dataset is unavailable.")
+    images = require_pricer().images
 
-    try:
-        with open(reference_image_metadata_path, newline="", encoding="utf-8-sig") as metadata_file:
-            reader = csv.DictReader(metadata_file)
-            required_columns = {"image_name", "complexity", "color"}
-            if not reader.fieldnames or not required_columns.issubset(reader.fieldnames):
-                raise HTTPException(
-                    status_code=503,
-                    detail="The tattoo reference image metadata file has an invalid format.",
-                )
-
-            image_metadata = {}
-            for row in reader:
-                filename = (row.get("image_name") or "").strip()
-                complexity = (row.get("complexity") or "").strip()
-                color = (row.get("color") or "").strip()
-                if not filename or complexity not in {"Simple", "Medium", "Complex"} or color not in {"Black_Gray", "Colored"}:
-                    raise HTTPException(
-                        status_code=503,
-                        detail="The tattoo reference image metadata contains an invalid entry.",
-                    )
-                image_metadata[filename] = {"complexity": complexity, "color": color}
-    except OSError as error:
-        raise HTTPException(
-            status_code=503,
-            detail="The tattoo reference image metadata file is unavailable.",
-        ) from error
-
-    allowed_extensions = ('.png', '.jpg', '.jpeg', '.webp', '.gif')
     image_files = [
-        filename for filename in os.listdir(reference_dataset_path)
-        if filename.lower().endswith(allowed_extensions)
-        and os.path.isfile(os.path.join(reference_dataset_path, filename))
-        and filename in image_metadata
+        filename for filename in images.index
+        if os.path.isfile(os.path.join(reference_dataset_path, filename))
     ]
     if len(image_files) < 6:
         raise HTTPException(
@@ -287,7 +154,18 @@ def get_random_reference_images():
         )
 
     selected_images = random.sample(image_files, 6)
+    metadata = {}
+    for filename in selected_images:
+        row = images.loc[filename]
+        metadata[filename] = {
+            "complexity": row["complexity"],
+            "color": row["color"],
+            "min_width_in": float(row["min_width_in"]),
+            "min_height_in": float(row["min_height_in"]),
+            "pixel_width": int(row["pixel_width"]),
+            "pixel_height": int(row["pixel_height"]),
+        }
     return {
-        "images": [f"{api_base_url}/reference-dataset/{urllib.parse.quote(filename)}" for filename in selected_images],
-        "metadata": {filename: image_metadata[filename] for filename in selected_images},
+            "images": [str(request.url_for("reference-dataset", path=filename)) for filename in selected_images],
+        "metadata": metadata,
     }

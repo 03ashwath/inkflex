@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 from datetime import datetime
 
 class HealthInputSchema(BaseModel):
@@ -42,11 +42,34 @@ class MeaningResult(BaseModel):
     interpretations: List[str]
     cultural_context: Optional[str] = None
 
+class PricePredictionRequest(BaseModel):
+    country: str = "India"
+    city: str
+    state: Optional[str] = None
+    location_type: Optional[str] = None
+    width_in: float = Field(gt=0)
+    height_in: float = Field(gt=0)
+    complexity: Literal["Simple", "Medium", "Complex"]
+    color: Literal["Black_Gray", "Colored"]
+    placement: Optional[str] = None
+
 class PricePredictionResult(BaseModel):
+    currency: Literal["INR"] = "INR"
     predicted_price_min: float
     predicted_price_max: float
     predicted_price_mid: float
+    width_in: float
+    height_in: float
+    area_sq_in: float
+    location_matched: bool
+    extrapolated: bool
     factors: List[str]
+
+class LocationOption(BaseModel):
+    name: str
+    state: str
+    location_type: str
+    parent_city: Optional[str] = None
 
 class FullAnalysisResult(BaseModel):
     request_id: str
