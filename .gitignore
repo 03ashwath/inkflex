@@ -46,4 +46,5 @@ ml/data/processed/
 *.zip
 
 # Model artifacts (optional local cache)
-ml/saved_models/
+ml/saved_models/*
+!ml/saved_models/price_model_v2.joblib
